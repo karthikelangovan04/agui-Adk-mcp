@@ -8,6 +8,7 @@ from google.adk.tools.mcp_tool import McpToolset, StdioConnectionParams
 from mcp import StdioServerParameters
 import os
 from dotenv import load_dotenv
+import json
 
 # Load environment variables from .env.local file
 load_dotenv(".env.local")
@@ -35,7 +36,9 @@ weather_toolset = McpToolset(
     )
 )
 
-# Human-in-the-loop confirmation tool
+# Human-in-the-loop confirmation tool schema (for agent instructions reference)
+# NOTE: This must be defined BEFORE the agent so it can be referenced in the f-string
+# NOTE: This is NOT added to the agent's tools - it's intercepted by the frontend
 CONFIRM_WEATHER_TOOL = {
     "type": "function",
     "function": {
@@ -56,6 +59,14 @@ CONFIRM_WEATHER_TOOL = {
                     "type": "number",
                     "description": "The longitude coordinate from geocoding"
                 },
+                "display_name": {
+                    "type": "string",
+                    "description": "Full display name from geocoding"
+                },
+                "state_code": {
+                    "type": "string",
+                    "description": "US state code for alerts (e.g., 'CA', 'NY')"
+                },
                 "options": {
                     "type": "array",
                     "items": {
@@ -67,8 +78,8 @@ CONFIRM_WEATHER_TOOL = {
                             },
                             "status": {
                                 "type": "string",
-                                "enum": ["enabled", "disabled"],
-                                "description": "Whether this option should be enabled by default"
+                                "enum": ["enabled"],
+                                "description": "The status of the option, always 'enabled'"
                             },
                             "action": {
                                 "type": "string",
@@ -78,10 +89,10 @@ CONFIRM_WEATHER_TOOL = {
                         },
                         "required": ["description", "status", "action"]
                     },
-                    "description": "Available weather information options for user to select"
+                    "description": "Array of 2 weather options (forecast and alerts), both enabled by default"
                 }
             },
-            "required": ["location", "options"]
+            "required": ["location", "latitude", "longitude", "display_name", "state_code", "options"]
         }
     }
 }
@@ -90,15 +101,15 @@ CONFIRM_WEATHER_TOOL = {
 weather_agent = Agent(
     model='gemini-2.0-flash',
     name='default',
-    instruction="""
+    instruction=f"""
 You are a helpful weather assistant with MCP tools and human-in-the-loop approval.
 
 **Available MCP Tools:**
 1. geocode_location(location: str) - Converts location names to coordinates
-   Returns: {"latitude": float, "longitude": float, "display_name": str}
+   Returns: {{"latitude": float, "longitude": float, "display_name": str}}
 
 2. get_forecast(latitude: float, longitude: float) - Gets detailed weather forecast
-   Returns: {
+   Returns: {{
      "temperature": float (Celsius),
      "temperature_f": float (Fahrenheit),
      "conditions": "clear" | "rain" | "cloudy" | "snow" | "storm",
@@ -106,29 +117,24 @@ You are a helpful weather assistant with MCP tools and human-in-the-loop approva
      "windSpeedText": str,
      "location": str,
      "periods": [array of forecast periods]
-   }
+   }}
 
 3. get_alerts(state: str) - Gets weather alerts for a US state (2-letter code like "CA", "NY")
-   Returns: {"alerts": [array of alert objects], "count": int}
+   Returns: {{"alerts": [array of alert objects], "count": int}}
 
 **Workflow for weather requests:**
 
 1. When user asks about weather for a location:
    a. Call geocode_location(location) to get coordinates
-   b. Extract the state from location if asking for alerts
-   c. Call confirm_weather_query with:
-      - location: the display_name from geocoding
-      - latitude & longitude: from geocoding result
-      - options: Array with both forecast and alerts options:
-        [
-          {"description": "Get current forecast", "status": "enabled", "action": "forecast"},
-          {"description": "Check weather alerts", "status": "enabled", "action": "alerts"}
-        ]
-   d. Wait for user confirmation with selected options
-   e. Based on what user selected:
-      - If "forecast" selected: call get_forecast(lat, lon)
-      - If "alerts" selected: call get_alerts(state_code)
-   f. Present results naturally
+   b. Parse the display_name to extract state code (last 2 letters if US location)
+   c. Call confirm_weather_query with the location info and both options enabled
+   d. The user will see a UI with checkboxes to select which information they want
+   e. After user confirms, you'll receive their selected actions
+   f. Based on the user's selection:
+      - If "forecast" selected: call get_forecast(lat, lon) and describe the weather
+      - If "alerts" selected: call get_alerts(state_code) and summarize alerts
+      - If both selected: call both tools and present both results
+   g. Present results naturally in your response
 
 2. When presenting forecast results, mention:
    - Temperature in both Celsius and Fahrenheit
@@ -141,15 +147,42 @@ You are a helpful weather assistant with MCP tools and human-in-the-loop approva
    - Most severe alerts first
    - Brief description of each
 
-**Example:**
+**Example conversation:**
 User: "What's the weather in San Francisco?"
-You: 
-1. geocode_location("San Francisco") -> {lat: 37.78, lon: -122.40, display_name: "San Francisco, California"}
-2. confirm_weather_query with forecast + alerts options
-3. [Wait for user selection]
-4. If forecast selected: get_forecast(37.78, -122.40)
-5. If alerts selected: get_alerts("CA")
-6. Present: "In San Francisco, it's currently 13°C (55°F) and clear. Wind is 9 mph from the northeast."
+
+Step 1: Call geocode_location("San Francisco")
+Result: {{"latitude": 37.7749, "longitude": -122.4194, "display_name": "San Francisco, California, United States"}}
+
+Step 2: Extract state code "CA" from display_name
+
+Step 3: Call confirm_weather_query(
+    location="San Francisco",
+    latitude=37.7749,
+    longitude=-122.4194,
+    display_name="San Francisco, California, United States",
+    state_code="CA",
+    options=[
+        {{"description": "Get current forecast", "status": "enabled", "action": "forecast"}},
+        {{"description": "Check weather alerts", "status": "enabled", "action": "alerts"}}
+    ]
+)
+
+Step 4: [User sees UI with checkboxes and confirms their selection]
+
+Step 5: Parse the response and call selected tools:
+- If forecast selected: get_forecast(37.7749, -122.4194)
+- If alerts selected: get_alerts("CA")
+
+Step 6: Present the results naturally
+
+**Important Notes:**
+- ALWAYS call confirm_weather_query after geocoding and BEFORE calling get_forecast or get_alerts
+- Extract state code from display_name (usually last part before country)
+- The confirm_weather_query tool will show a UI to the user with checkboxes
+- Only call the MCP tools (get_forecast, get_alerts) that the user selected in their response
+- The tools (get_forecast, get_alerts) will render UI cards automatically on the frontend
+
+Tool reference: {CONFIRM_WEATHER_TOOL}
     """,
     tools=[weather_toolset],
 )

@@ -128,6 +128,8 @@ export async function POST(req: NextRequest) {
     
     let buffer = '';  // Buffer for incomplete lines
     
+    let hasError = false; // Track if we've seen an error
+    
     const transformStream = new TransformStream({
       transform(chunk, controller) {
         // Add chunk to buffer
@@ -143,9 +145,19 @@ export async function POST(req: NextRequest) {
           if (line.startsWith('data:')) {
             let dataLine = line;
             
-            // Try to parse and transform TOOL_CALL_RESULT events
+            // Try to parse and transform events
             try {
               const jsonData = JSON.parse(line.substring(5).trim());
+              
+              // Track error state
+              if (jsonData.type === 'RUN_ERROR') {
+                hasError = true;
+              }
+              
+              // If we've seen an error, skip RUN_FINISHED events
+              if (hasError && jsonData.type === 'RUN_FINISHED') {
+                continue; // Skip this event
+              }
               
               // If this is a TOOL_CALL_RESULT, unwrap the content
               if (jsonData.type === 'TOOL_CALL_RESULT' && jsonData.content) {
